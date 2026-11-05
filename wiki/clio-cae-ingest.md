@@ -119,4 +119,6 @@ causes are not yet separated:
 - Confirm the server folder names (`HDF5_Trimmed/`, `CSV_only/`); this needs working
   access.
 - Check that HDF5 dataset names with commas map to valid CTE tag names.
+- Test whether the CLIO HDF5 VOL connector can read the ingested tags; see [[neurofair]] for
+  which CLIO read paths actually serve data from the CTE.
 - Record the download and ingest timings.
