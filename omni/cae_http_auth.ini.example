@@ -1,0 +1,13 @@
+# PhysioNet credentials for CLIO CAE https:// sources (iowarp/clio-core PR #1331).
+#
+#   install -m 600 cae_http_auth.ini.example ~/.clio/cae_http_auth.ini
+#   export PHYSIONET_USER=<physionet-username>
+#   read -rs PHYSIONET_PASSWORD; export PHYSIONET_PASSWORD
+#
+# The account must be credentialed and have signed the TARGET-MAP data use agreement.
+# CAE sends user/password as HTTP basic auth, passing them to curl on stdin, never argv.
+# A file holding a password must be chmod 600; ${VAR} keeps the secret out of the file.
+
+[https://physionet.org/files/]
+user = ${PHYSIONET_USER}
+password = ${PHYSIONET_PASSWORD}

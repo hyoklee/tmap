@@ -29,7 +29,8 @@ Some recordings also include EEG.
 | clinical `.csv` | De-identified baseline clinical data (~5 KB) |
 
 Files range from about 2.5 MB to about 198 MB. The HDF5 files are the natural input for
-CLIO I/O tests.
+CLIO I/O tests. Table 1 lists 124 files (39 `.h5`, 85 `.csv`, 6.36 GB in all); see
+[[clio-cae-ingest]] for the inventory and the OMNI files that ingest them.
 
 ## Access
 
@@ -54,5 +55,5 @@ Also cite Pollard, T., et al. (2026). PhysioNet as a global platform for biomedi
 
 ## Open
 
-- Download the data and record the actual file inventory (count, sizes, HDF5 layout).
-- Decide which CLIO component and workloads to test.
+- Run the [[clio-cae-ingest]] OMNI files and record the actual inventory and HDF5 layout.
+- Decide which CLIO workloads to test after ingest.
