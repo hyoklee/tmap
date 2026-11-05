@@ -1,0 +1,6 @@
+# Restricted PhysioNet data (DUA) - never commit
+data/
+physionet.org/
+*.h5
+*.hdf5
+*.csv
