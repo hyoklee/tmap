@@ -1,0 +1,173 @@
+#!/bin/bash
+#PBS -N tmap-cae
+#PBS -l select=1:system=polaris
+#PBS -l walltime=01:00:00
+#PBS -l filesystems=home:eagle
+#PBS -q debug
+#PBS -A radix-io
+#PBS -j oe
+#PBS -o /eagle/radix-io/hyoklee/tmap_data/cae_ingest.log
+#
+# Runs the TARGET-MAP OMNI files (smoke, then hdf5 and csv) on one Polaris node:
+#   1. Build clio-core (CPU only, CAE + HDF5) from the worktree at PR #1331
+#      (feat/cae-http-source), incrementally after the first time.
+#   2. Probe the server folder names with cae_http_tool.
+#   3. Start the CLIO runtime (DRAM tier), run clio_cae on each OMNI file.
+#   4. Check each download against Table 1's size, the HDF5 signature, and the
+#      CTE tags against the file's dataset count.
+# Credentials: ~/.clio/cae_http_auth.ini reads ${PHYSIONET_USER}/${PHYSIONET_PASSWORD},
+# which this script exports from ~/.clio/.physionet_user and .physionet_password
+# (chmod 600), so they never appear in the job's qsub environment.
+# Output: /eagle/radix-io/hyoklee/tmap_data/runs/run_<jobid>/ (mode 700 tree).
+set -uo pipefail
+SRC=${SRC:-/home/hyoklee/clio-core.http}
+TMAP=/home/hyoklee/tmap
+ROOT=/eagle/radix-io/hyoklee/tmap_data
+DATA=$ROOT/target-map/1.0.0
+BUILD=${BUILD:-$ROOT/build_http}
+BIN=$BUILD/bin
+OMNIS=${OMNIS:-"smoke hdf5 csv"}   # omni/target_map_<name>.omni.yaml, in order; stops if smoke fails
+MANIFEST=$TMAP/raw/2026-11-05-physionet-target-map-files.tsv
+CONDA=/home/hyoklee/miniconda3
+CMAKE=$CONDA/bin/cmake
+JOBID=${PBS_JOBID%%.*}
+umask 077
+mkdir -p -m 700 "$ROOT" "$DATA" "$ROOT/runs"
+chmod 700 "$ROOT"
+RUN=$ROOT/runs/run_${JOBID:-manual}
+mkdir -p "$RUN"
+exec > >(tee -a "$RUN/job.log") 2>&1
+T0=$SECONDS
+ts() { echo "[$(date +%T) +$((SECONDS - T0))s] $*"; }
+ts "host=$(hostname) run=$RUN clio-core=$(git -C "$SRC" log --oneline -1)"
+
+export http_proxy=http://proxy.alcf.anl.gov:3128 https_proxy=http://proxy.alcf.anl.gov:3128
+export HTTP_PROXY=$http_proxy HTTPS_PROXY=$https_proxy no_proxy=localhost,127.0.0.1 NO_PROXY=localhost,127.0.0.1
+PHYSIONET_USER=$(cat ~/.clio/.physionet_user) PHYSIONET_PASSWORD=$(cat ~/.clio/.physionet_password)
+export PHYSIONET_USER PHYSIONET_PASSWORD
+
+# --- 1. build ------------------------------------------------------------------
+if [ ! -f "$BUILD/CMakeCache.txt" ]; then
+  $CMAKE -S "$SRC" -B "$BUILD" -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_C_COMPILER=/usr/bin/gcc-14 -DCMAKE_CXX_COMPILER=/usr/bin/g++-14 \
+    -DCMAKE_PREFIX_PATH=$CONDA -DHDF5_DIR=$CONDA/cmake \
+    -DPoco_DIR=$CONDA/lib/cmake/Poco -Dcereal_DIR=$CONDA/lib/cmake/cereal \
+    -Dmsgpack-c_DIR=$CONDA/lib/cmake/msgpack-c -Dnlohmann_json_ROOT=/home/hyoklee/deps/nlohmann_json \
+    -DCLIO_CORE_ENABLE_RUNTIME=ON -DCLIO_CORE_ENABLE_CTE=ON -DCLIO_CORE_ENABLE_CAE=ON \
+    -DCLIO_CORE_ENABLE_HDF5=ON -DCLIO_CORE_ENABLE_CUDA=OFF \
+    -DCLIO_CORE_ENABLE_TESTS=OFF -DCLIO_CORE_ENABLE_BENCHMARKS=OFF > "$RUN/configure.log" 2>&1 \
+    || { ts "ERROR: configure failed"; tail -30 "$RUN/configure.log"; exit 1; }
+fi
+grep -q '^CLIO_CORE_ENABLE_HDF5:BOOL=ON' "$BUILD/CMakeCache.txt" || { ts "ERROR: HDF5 is not ON"; exit 1; }
+$CMAKE --build "$BUILD" -j "$(nproc)" > "$RUN/build.log" 2>&1 \
+  || { ts "ERROR: build failed"; grep -m5 -B2 -A5 'error' "$RUN/build.log"; exit 1; }
+for exe in clio_run clio_cae cae_http_tool cte_search; do
+  [ -x "$BIN/$exe" ] || { ts "ERROR: $exe not built"; exit 1; }
+done
+ts "build OK"
+
+# --- 2. probe folder names -----------------------------------------------------
+BASE=https://physionet.org/files/target-map/1.0.0
+H5=$(awk -F'\t' '$2=="h5"' "$MANIFEST" | sort -t$'\t' -k3n | head -1 | cut -f1)
+CSV1=$(awk -F'\t' '$2=="csv" && $1 ~ /^TAR/' "$MANIFEST" | head -1 | cut -f1)
+for u in "$BASE/deidentified_target_clinical_data_final.csv" "$BASE/HDF5_Trimmed/$H5" \
+         "$BASE/CSV_only/$CSV1" "$BASE/CSV%20only/$CSV1"; do
+  out=$(timeout 60 "$BIN/cae_http_tool" probe "$u" 2>&1 | tail -2 | tr '\n' ' ')
+  echo "PROBE rc=$? ${u#$BASE/} :: $out"
+done
+
+# --- 3. runtime + clio_cae -----------------------------------------------------
+export CLIO_SERVER_CONF=$RUN/clio_server.yaml CLIO_MEMFD_DIR=/tmp/clio_memfd_${JOBID:-manual}
+export CLIO_IPC_MODE=SHM CTP_LOG_LEVEL=${CTP_LOG_LEVEL:-info}
+mkdir -p "$CLIO_MEMFD_DIR"
+cat > "$CLIO_SERVER_CONF" <<EOF
+memory:
+  main_segment_size: auto
+  client_data_segment_size: 4GB
+networking:
+  port: ${CLIO_PORT:-9415}
+runtime:
+  num_threads: 16
+  queue_depth: 1024
+compose:
+  - mod_name: clio_cae_core
+    pool_name: cae_main
+    pool_query: local
+    pool_id: "400.0"
+    next_pool_id: "512.0"
+  - mod_name: clio_cte_core
+    pool_name: cte_main
+    pool_query: local
+    pool_id: "512.0"
+    storage:
+      - path: "ram::tmap_ram"
+        bdev_type: "ram"
+        capacity_limit: "64GB"
+        score: 1.0
+    dpe:
+      dpe_type: "max_bw"
+    performance:
+      flush_data_period_ms: 0
+EOF
+RT=""
+cleanup() {
+  set +e
+  [ -n "$RT" ] && { timeout 120 "$BIN/clio_run" stop >> "$RUN/runtime.log" 2>&1; sleep 2; kill -9 "$RT" 2>/dev/null; }
+  rm -rf "${CLIO_MEMFD_DIR:?}"
+}
+trap cleanup EXIT
+"$BIN/clio_run" start --fresh --disk "$RUN/clio_disk" --no-viz > "$RUN/runtime.log" 2>&1 &
+RT=$!
+for _ in $(seq 90); do
+  "$BIN/clio_run" status > /dev/null 2>&1 && break
+  kill -0 $RT 2>/dev/null || { ts "ERROR: runtime exited"; tail -20 "$RUN/runtime.log"; exit 1; }
+  sleep 2
+done
+"$BIN/clio_run" status > /dev/null 2>&1 || { ts "ERROR: runtime not up after 180 s"; exit 1; }
+sleep 5
+ts "runtime up"
+
+run_omni() {   # run_omni <name>: clio_cae on one OMNI file, then check what it landed
+local OMNI=$TMAP/omni/target_map_$1.omni.yaml
+ts "=== $1: $(grep -c '^  - src: "https' "$OMNI") files"
+local t0 rc fail=0 bytes=0 dt
+t0=$(date +%s.%N)
+"$BIN/clio_cae" "$OMNI" > "$RUN/clio_cae_$1.log" 2>&1
+rc=$?
+dt=$(echo "$(date +%s.%N) - $t0" | bc)
+ts "clio_cae $1 rc=$rc in $dt s"
+grep -E 'HttpFileAssimilator|ParseOmni|ERROR|FAILED|assimilat' "$RUN/clio_cae_$1.log" "$RUN/runtime.log" | cut -c1-300 | tail -30
+
+while IFS=$'\t' read -r name fmt size; do
+  [ "$name" = name ] && continue
+  dst=$(grep -o "file::$DATA/[^\"]*/$name\"\|file::$DATA/$name\"" "$OMNI" | head -1 | sed 's/^file:://; s/"$//')
+  [ -n "$dst" ] || continue
+  got=$(stat -c %s "$dst" 2>/dev/null || echo missing)
+  ok=no; [ "$got" = "$size" ] && ok=yes && bytes=$((bytes + size))
+  [ $ok = yes ] || fail=1
+  extra=""
+  if [ "$fmt" = h5 ] && [ -f "$dst" ]; then
+    sig=$(head -c 8 "$dst" | od -An -tx1 | tr -d ' \n')
+    nds=$("$CONDA/bin/h5ls" -r "$dst" 2>/dev/null | grep -c ' Dataset ')
+    stem=${name%.h5}
+    ntag=$("$BIN/cte_search" "target_map/hdf5/${stem}.*" --tags-only 2>/dev/null | grep -c "target_map/hdf5/${stem}")
+    extra="signature=$sig (hdf5 89484446...) datasets=$nds cte_tags=$ntag"
+  elif [ -f "$dst" ]; then
+    stem=${name%.csv}
+    ntag=$("$BIN/cte_search" "target_map/csv/${stem}" --tags-only 2>/dev/null | grep -c "target_map/csv/${stem}")
+    nblob=$("$BIN/cte_search" "target_map/csv/${stem}" 2>/dev/null | grep -c .)
+    extra="cte_tags=$ntag blobs=$nblob"
+  fi
+  echo "CHECK $name size=$got want=$size match=$ok $extra"
+done < "$MANIFEST"
+ts "$1: clio_cae rc=$rc, $bytes bytes in $dt s = $(echo "scale=1; $bytes / 1000000 / $dt" | bc) MB/s (download + ingest), size check $([ $fail = 0 ] && echo pass || echo FAIL)"
+[ $rc = 0 ] && [ $fail = 0 ]
+}
+
+# --- 4. run each OMNI file ------------------------------------------------------
+for o in $OMNIS; do
+  run_omni $o || { [ $o = smoke ] && { ts "smoke failed; not running the rest"; break; }; }
+done
+echo "=== all target_map tags (count): $("$BIN/cte_search" 'target_map/.*' --tags-only 2>/dev/null | grep -c .)"
+echo "=== runtime errors: $(grep -c ' ERROR ' "$RUN/runtime.log")"
+ts "done"

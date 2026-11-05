@@ -1,7 +1,7 @@
 # Ingesting TARGET-MAP with CLIO CAE
 
 Sources: `raw/2026-11-05-physionet-target-map-files.tsv` (Table 1 of the PhysioNet
-landing page), [[target-map]], and iowarp/clio-core PRs #1331 and #1332 (open on 2026-11-05).
+landing page), `raw/2026-11-05-cae-ingest-job-7817854.md` (first run), [[target-map]], and iowarp/clio-core PRs #1331 and #1332 (open on 2026-11-05).
 
 ## File inventory
 
@@ -59,16 +59,64 @@ the radix-io group and CAE creates files 0644. So create the root with
 
 ## Run
 
-1. Build clio-core with PR #1331 (and #1332 if wanted). Neither is merged into `dev`
-   yet.
-2. Set up credentials from `omni/cae_http_auth.ini.example`.
-3. Create the data root: `mkdir -p -m 700 /eagle/radix-io/hyoklee/tmap_data/target-map/1.0.0`.
-4. Start the runtime, then run `clio_cae omni/target_map_smoke.omni.yaml`. Then run the
-   hdf5 and csv files.
-5. Polaris compute nodes need `https_proxy=http://proxy.alcf.anl.gov:3128`.
+`polaris/cae_ingest.pbs` does all of it in one Polaris debug job (`qsub polaris/cae_ingest.pbs`):
+
+1. Build clio-core (CPU only, CAE + CTE + HDF5) from a worktree of PR #1331's branch
+   (`~/clio-core.http`) into `/eagle/radix-io/hyoklee/tmap_data/build_http`. Later runs
+   rebuild incrementally. PR #1332 is not needed.
+2. Export `PHYSIONET_USER`/`PHYSIONET_PASSWORD` from the hidden files
+   `~/.clio/.physionet_user` and `~/.clio/.physionet_password` (chmod 600).
+   `~/.clio/cae_http_auth.ini` reads them through `${VAR}`, so the secret is never in
+   `qsub -v` or `qstat -f`.
+3. Probe the top level, `HDF5_Trimmed/`, `CSV_only/` and `CSV%20only/` with
+   `cae_http_tool`.
+4. Start the runtime (64 GB DRAM tier) and run `clio_cae` on the smoke, hdf5 and csv
+   OMNI files in turn. If the smoke file fails, the job stops.
+5. Check each download's size against Table 1. For HDF5 files, also check the file
+   signature and compare the dataset count (`h5ls -r`) with the CTE tag count
+   (`cte_search --tags-only`).
+
+The job sets `https_proxy=http://proxy.alcf.anl.gov:3128` for the compute node. Output
+goes to the mode-700 tree `/eagle/radix-io/hyoklee/tmap_data/` (`cae_ingest.log`,
+`runs/run_<jobid>/`).
+
+## Results
+
+**Job 7817854, 2026-11-05: blocked by PhysioNet (HTTP 403)**
+(`raw/2026-11-05-cae-ingest-job-7817854.md`)
+
+What worked:
+- The PR #1331 build: 121 s from scratch on one node.
+- Credential lookup: `cae_http_tool` matched the `[https://physionet.org/files/]`
+  section and sent basic auth.
+- Runtime start, and `LoadOmni` loading 4 of 4 smoke transfers.
+
+What failed:
+- Every probe returned 403: the clinical CSV at the top level, `HDF5_Trimmed/`,
+  `CSV_only/` and `CSV%20only/`.
+- `ParseOmni` failed on the first transfer with result code -403, and nothing was
+  downloaded or ingested.
+
+Because the top-level file fails too, the folder names are not the cause. The 403 page
+is the same with and without credentials: a "Log in" link and "You dont have access to
+see this page". So PhysioNet does not treat the request as logged in. The two possible
+causes are not yet separated:
+
+1. **Account access:** the account is not credentialed yet, or the TARGET-MAP data use
+   agreement is not signed. Then even a correct login is refused.
+2. **Login flow:** PhysioNet's documented client is `wget --user ... --ask-password`,
+   and the server may only accept that login flow. CAE (curl) sends basic auth with
+   the first request. If wget works with the same account, PR #1331's client needs to
+   handle PhysioNet's login.
+
+**How to tell them apart:** download the 5 KB clinical CSV with
+`wget --user <user> --ask-password`. A 403 means cause 1; a download means cause 2.
 
 ## Open
 
-- Confirm the server folder names (`HDF5_Trimmed/`, `CSV_only/`).
+- Separate the two causes of the 403 with the wget test above; then rerun
+  `polaris/cae_ingest.pbs`.
+- Confirm the server folder names (`HDF5_Trimmed/`, `CSV_only/`); this needs working
+  access.
 - Check that HDF5 dataset names with commas map to valid CTE tag names.
 - Record the download and ingest timings.
