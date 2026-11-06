@@ -5,9 +5,13 @@
 #   read -rs PHYSIONET_PASSWORD; export PHYSIONET_PASSWORD
 #
 # The account must be credentialed and have signed the TARGET-MAP data use agreement.
-# CAE sends user/password as HTTP basic auth, passing them to curl on stdin, never argv.
+# CAE sends user/password as HTTP basic auth, never on argv (curl reads them on stdin,
+# wget from a private config file).
 # A file holding a password must be chmod 600; ${VAR} keeps the secret out of the file.
 
 [https://physionet.org/files/]
 user = ${PHYSIONET_USER}
 password = ${PHYSIONET_PASSWORD}
+# PhysioNet accepts basic auth only from wget (and its own clients); other user agents
+# get 403 with no auth challenge. client = wget needs clio-core d2f4edf42 or later.
+client = wget

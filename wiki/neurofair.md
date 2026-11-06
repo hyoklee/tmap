@@ -46,6 +46,40 @@ The two share no data.
 - NeuroFAIR has not met commas in dataset names, so tmap's open question about how they
   map to CTE tag names is new.
 
+## Can MiV-Simulator or neuroh5 do TARGET-MAP science?
+
+No. Query answered 2026-11-06 from general domain knowledge, not from a source in `raw/`.
+
+- **neuroh5 is not a simulator.** It is an HDF5 format and library for network models:
+  cell attributes and connections (`Projections/<SRC>/<DST>/Edges`). The simulator is
+  MiV-Simulator, which runs a spiking CA1 microcircuit and uses neuroh5 for its input
+  and output (`NF:overview.md`).
+- **The variables differ.** TARGET-MAP measures cerebral blood-flow velocity (TCD) and
+  arterial blood pressure to study cerebral autoregulation ([[target-map]]). MiV models
+  no vessels, blood flow, blood pressure or neurovascular coupling, so it cannot produce
+  or explain these signals.
+- **The scales differ.** MiV simulates milliseconds of activity in a few mm² of
+  hippocampus. TARGET-MAP covers hours of whole-brain blood flow. Linking them would need
+  a neurovascular-coupling model, which MiV does not have.
+
+What fits TARGET-MAP instead:
+
+- **Autoregulation measures** computed from the recordings: the moving-window
+  correlation between blood pressure and flow velocity (Mx), and transfer-function
+  analysis following the CARNet white paper.
+- **Small circulation models** for simulation: lumped-parameter models (the Ursino
+  family) or Windkessel models fitted to each patient's pressure and flow traces.
+
+What tmap can still take from NeuroFAIR:
+
+- **I/O infrastructure:** CAE ingest, the VOL read path from the CTE, and the Polaris and
+  Aurora run lessons (sections above).
+- **Benchmark contrast:** MiV is compute-bound, while an autoregulation analysis over
+  many recordings is closer to I/O-bound (table above).
+- **Parallel read patterns:** neuroh5's way of splitting reads across MPI ranks could be
+  borrowed for a parallel analysis. Its cell and connection data model does not suit
+  time series, so tmap should not store data in neuroh5.
+
 ## Open
 
 - Once PhysioNet access works, test whether the CLIO VOL connector reads the tags CAE

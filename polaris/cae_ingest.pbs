@@ -11,10 +11,13 @@
 # Runs the TARGET-MAP OMNI files (smoke, then hdf5 and csv) on one Polaris node:
 #   1. Build clio-core (CPU only, CAE + HDF5) from the worktree at PR #1331
 #      (feat/cae-http-source), incrementally after the first time.
-#   2. Probe the server folder names with cae_http_tool.
+#   2. Probe one file per server folder with cae_http_tool.
 #   3. Start the CLIO runtime (DRAM tier), run clio_cae on each OMNI file.
-#   4. Check each download against Table 1's size, the HDF5 signature, and the
-#      CTE tags against the file's dataset count.
+#   4. Check each download's SHA-256 against PhysioNet's SHA256SUMS.txt (kept in
+#      the private data directory), the HDF5 signature, and the CTE tags
+#      against the file's dataset count.
+# PhysioNet accepts basic auth only from wget, so cae_http_auth.ini sets
+# client = wget for https://physionet.org/files/ (clio-core d2f4edf42).
 # Credentials: ~/.clio/cae_http_auth.ini reads ${PHYSIONET_USER}/${PHYSIONET_PASSWORD},
 # which this script exports from ~/.clio/.physionet_user and .physionet_password
 # (chmod 600), so they never appear in the job's qsub environment.
@@ -27,7 +30,7 @@ DATA=$ROOT/target-map/1.0.0
 BUILD=${BUILD:-$ROOT/build_http}
 BIN=$BUILD/bin
 OMNIS=${OMNIS:-"smoke hdf5 csv"}   # omni/target_map_<name>.omni.yaml, in order; stops if smoke fails
-MANIFEST=$TMAP/raw/2026-11-05-physionet-target-map-files.tsv
+SUMS=$DATA/SHA256SUMS.txt   # private: checksums of restricted files stay off the repo
 CONDA=/home/hyoklee/miniconda3
 CMAKE=$CONDA/bin/cmake
 JOBID=${PBS_JOBID%%.*}
@@ -68,10 +71,10 @@ ts "build OK"
 
 # --- 2. probe folder names -----------------------------------------------------
 BASE=https://physionet.org/files/target-map/1.0.0
-H5=$(awk -F'\t' '$2=="h5"' "$MANIFEST" | sort -t$'\t' -k3n | head -1 | cut -f1)
-CSV1=$(awk -F'\t' '$2=="csv" && $1 ~ /^TAR/' "$MANIFEST" | head -1 | cut -f1)
-for u in "$BASE/deidentified_target_clinical_data_final.csv" "$BASE/HDF5_Trimmed/$H5" \
-         "$BASE/CSV_only/$CSV1" "$BASE/CSV%20only/$CSV1"; do
+[ -s "$SUMS" ] || "$BIN/cae_http_tool" get "$BASE/SHA256SUMS.txt" "$SUMS" > /dev/null 2>&1 \
+  || { ts "ERROR: cannot fetch SHA256SUMS.txt"; exit 1; }
+for u in "$BASE/deidentified_target_clinical_data_final.csv" \
+         "$BASE/HDF5_Trimmed/TAR004_D4_ALL_TRIMMED.h5" "$BASE/CSV_files/TAR001_D2_LMCA_RMCA.csv"; do
   out=$(timeout 60 "$BIN/cae_http_tool" probe "$u" 2>&1 | tail -2 | tr '\n' ' ')
   echo "PROBE rc=$? ${u#$BASE/} :: $out"
 done
@@ -138,15 +141,16 @@ dt=$(echo "$(date +%s.%N) - $t0" | bc)
 ts "clio_cae $1 rc=$rc in $dt s"
 grep -E 'HttpFileAssimilator|ParseOmni|ERROR|FAILED|assimilat' "$RUN/clio_cae_$1.log" "$RUN/runtime.log" | cut -c1-300 | tail -30
 
-while IFS=$'\t' read -r name fmt size; do
-  [ "$name" = name ] && continue
-  dst=$(grep -o "file::$DATA/[^\"]*/$name\"\|file::$DATA/$name\"" "$OMNI" | head -1 | sed 's/^file:://; s/"$//')
-  [ -n "$dst" ] || continue
+local dst rel name got want ok extra sig nds stem ntag nblob
+while read -r dst; do
+  rel=${dst#$DATA/}; name=${rel##*/}
   got=$(stat -c %s "$dst" 2>/dev/null || echo missing)
-  ok=no; [ "$got" = "$size" ] && ok=yes && bytes=$((bytes + size))
-  [ $ok = yes ] || fail=1
+  want=$(awk -v p="$rel" '$2 == p {print $1}' "$SUMS")
+  ok=no
+  [ -f "$dst" ] && [ -n "$want" ] && [ "$(sha256sum "$dst" | cut -d' ' -f1)" = "$want" ] && ok=yes
+  if [ $ok = yes ]; then bytes=$((bytes + got)); else fail=1; fi
   extra=""
-  if [ "$fmt" = h5 ] && [ -f "$dst" ]; then
+  if [[ $name == *.h5 ]] && [ -f "$dst" ]; then
     sig=$(head -c 8 "$dst" | od -An -tx1 | tr -d ' \n')
     nds=$("$CONDA/bin/h5ls" -r "$dst" 2>/dev/null | grep -c ' Dataset ')
     stem=${name%.h5}
@@ -158,9 +162,9 @@ while IFS=$'\t' read -r name fmt size; do
     nblob=$("$BIN/cte_search" "target_map/csv/${stem}" 2>/dev/null | grep -c .)
     extra="cte_tags=$ntag blobs=$nblob"
   fi
-  echo "CHECK $name size=$got want=$size match=$ok $extra"
-done < "$MANIFEST"
-ts "$1: clio_cae rc=$rc, $bytes bytes in $dt s = $(echo "scale=1; $bytes / 1000000 / $dt" | bc) MB/s (download + ingest), size check $([ $fail = 0 ] && echo pass || echo FAIL)"
+  echo "CHECK $rel size=$got sha256=$ok $extra"
+done < <(grep -o '^    dst: "file::[^"]*"' "$OMNI" | sed 's/^    dst: "file:://; s/"$//')
+ts "$1: clio_cae rc=$rc, $bytes bytes in $dt s = $(echo "scale=1; $bytes / 1000000 / $dt" | bc) MB/s (download + ingest), sha256 check $([ $fail = 0 ] && echo pass || echo FAIL)"
 [ $rc = 0 ] && [ $fail = 0 ]
 }
 
