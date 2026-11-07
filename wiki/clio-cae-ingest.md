@@ -134,12 +134,12 @@ minutes. The scheduler then logged `[#781] worker STALLED` and `[#785] RESCUE` 3
 times and spawned 5 elastic workers. At the 31st HDF5 ingest the runtime started looping on
 `GlobalDeserialize::read_binary: Attempted to read beyond end of data` (19.1 M lines,
 4.5 GB of log) and never finished. The same 31 ingests run cleanly in 22 s without
-downloads, so the trigger is the long-running task, not the data. Not yet reported to
-iowarp/clio-core.
+downloads, so the trigger is the long-running task, not the data. Reported on clio-core PR #1331
+(2026-11-07, https://github.com/iowarp/clio-core/pull/1331#issuecomment-6703093548).
 
 ## Open
 
-- Report the runtime hang to iowarp/clio-core.
+- Follow up on the runtime-hang report on PR #1331.
 - Test whether the CLIO HDF5 VOL connector can read the ingested tags; see [[neurofair]] for
   which CLIO read paths actually serve data from the CTE.
 - The CTE holds the data only while the runtime runs (DRAM tier); a read benchmark has to
