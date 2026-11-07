@@ -10,6 +10,7 @@
 #
 # Each file: an https download to file::, then ingest into the CTE once that download
 # is done (depends_on = the download's dst). A re-run skips files already downloaded.
+# (*_ingest.omni.yaml files hold the ingest transfers only.)
 version: "1.0"
 
 transfers:

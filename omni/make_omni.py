@@ -16,7 +16,12 @@ Each file is two transfers, run in order by clio_cae:
      CSV:  format binary, one CTE tag per file
      depends_on names the download's dst, so ingest waits for that download.
 
-usage: make_omni.py [--data DIR] [--tag-root NAME]
+With --ingest-only, write target_map_{hdf5,csv}_ingest.omni.yaml instead: step 2 only,
+for files already downloaded (for example with cae_http_tool get). Use these for the
+full dataset: one clio_cae run that downloads for hours hung the runtime (wiki:
+clio-cae-ingest), while ingest alone takes seconds.
+
+usage: make_omni.py [--data DIR] [--tag-root NAME] [--ingest-only]
 """
 import argparse
 from pathlib import Path
@@ -40,29 +45,38 @@ HEADER = """\
 #
 # Each file: an https download to file::, then ingest into the CTE once that download
 # is done (depends_on = the download's dst). A re-run skips files already downloaded.
+# (*_ingest.omni.yaml files hold the ingest transfers only.)
 version: "1.0"
 
 transfers:
 """
 
 
+def ingest(rel, args):
+    """The transfer that ingests one downloaded file into the CTE."""
+    local = f"{args.data}/{rel}"
+    stem = rel.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+    if rel.endswith(".h5"):
+        return (f'  - src: "hdf5::{local}"\n'
+                f'    dst: "iowarp::{args.tag_root}/hdf5/{stem}"\n'
+                f'    format: "hdf5"\n')
+    return (f'  - src: "file::{local}"\n'
+            f'    dst: "iowarp::{args.tag_root}/csv/{stem}"\n'
+            f'    format: "binary"\n')
+
+
 def entries(paths, args):
     for rel in paths:
+        if args.ingest_only:
+            yield f"  # {rel}\n" + ingest(rel, args)
+            continue
         local = f"{args.data}/{rel}"
-        name = rel.rsplit("/", 1)[-1]
-        stem = name.rsplit(".", 1)[0]
-        if name.endswith(".h5"):
-            ingest = dict(src=f"hdf5::{local}", dst=f"iowarp::{args.tag_root}/hdf5/{stem}", format="hdf5")
-        else:
-            ingest = dict(src=f"file::{local}", dst=f"iowarp::{args.tag_root}/csv/{stem}", format="binary")
         yield (f"  # {rel}\n"
                f'  - src: "{BASE_URL}/{quote(rel)}"\n'
                f'    dst: "file::{local}"\n'
                f'    format: "binary"\n'
-               f'  - src: "{ingest["src"]}"\n'
-               f'    dst: "{ingest["dst"]}"\n'
-               f'    format: "{ingest["format"]}"\n'
-               f'    depends_on: "file::{local}"\n')
+               + ingest(rel, args)
+               + f'    depends_on: "file::{local}"\n')
 
 
 def write(fname, what, paths, args):
@@ -77,6 +91,8 @@ def main():
     ap.add_argument("--data", default="/eagle/radix-io/hyoklee/tmap_data/target-map/1.0.0",
                     help="local copy of the dataset (src/dst paths are not ${VAR}-expanded, so absolute)")
     ap.add_argument("--tag-root", default="target_map", help="CTE tag prefix")
+    ap.add_argument("--ingest-only", action="store_true",
+                    help="write *_ingest.omni.yaml files for data already downloaded")
     args = ap.parse_args()
 
     paths = [l.strip() for l in open(PATHS) if l.strip() and not l.startswith("#")]
@@ -85,6 +101,11 @@ def main():
     csvs = [p for p in data if p.endswith(".csv")]
     assert all(s in data for s in SMOKE), "smoke files missing from the path list"
 
+    if args.ingest_only:
+        note = "Ingest only: the files must already be downloaded and verified"
+        write("target_map_hdf5_ingest.omni.yaml", f"HDF5_Trimmed. {note}", h5, args)
+        write("target_map_csv_ingest.omni.yaml", f"CSV_files and top-level CSVs. {note}", csvs, args)
+        return
     write("target_map_smoke.omni.yaml", "Smoke test: the clinical CSV and one 50.9 MB HDF5 file",
           SMOKE, args)
     write("target_map_hdf5.omni.yaml", "HDF5_Trimmed: raw, unsynchronized recordings", h5, args)

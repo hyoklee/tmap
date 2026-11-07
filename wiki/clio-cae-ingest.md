@@ -1,124 +1,146 @@
 # Ingesting TARGET-MAP with CLIO CAE
 
 Sources: `raw/2026-11-05-physionet-target-map-files.tsv` (Table 1 of the PhysioNet
-landing page), `raw/2026-11-05-cae-ingest-job-7817854.md` (first run), [[target-map]], and iowarp/clio-core PRs #1331 and #1332 (open on 2026-11-05).
+landing page), `raw/2026-11-05-physionet-target-map-paths.txt` (the server's
+SHA256SUMS.txt paths), `raw/2026-11-05-cae-ingest-job-7817854.md` (first run),
+`raw/2026-11-06-cae-ingest-runs.md` (later runs), [[target-map]], and iowarp/clio-core
+PRs #1331 and #1332.
+
+**Status (2026-11-06):** all 155 data files (10.5 GB) are downloaded, pass SHA-256, and
+are ingested into the CTE in 69 s: 1,174 `target_map` tags. The working recipe is
+download with `cae_http_tool get`, then ingest with the `*_ingest.omni.yaml` files. One
+`clio_cae` run that downloads and ingests everything hangs the runtime (see Results).
 
 ## File inventory
 
-From Table 1: 124 files, 6,364,562,428 bytes (6.36 GB).
+The landing page and the server disagree. Table 1 (`raw/2026-11-05-physionet-target-map-files.tsv`)
+lists 124 files, 6.36 GB, a `CSV_only/` folder and a 5,009-byte clinical CSV. The
+server's SHA256SUMS.txt (`raw/2026-11-06-cae-ingest-runs.md`) is the one that matches
+the downloads:
 
-| Kind | Server folder | Files | Bytes |
-|------|---------------|-------|-------|
-| Raw recordings, `.h5` | `HDF5_Trimmed/` | 39 | 4,342,153,628 |
-| Synchronized ABP/TCD, `.csv` | `CSV_only/` | 84 | 2,022,403,791 |
-| Clinical `.csv` | top level | 1 | 5,009 |
+| Kind | Server folder | Files | Bytes | Size range |
+|------|---------------|-------|-------|------------|
+| Raw recordings, `.h5` | `HDF5_Trimmed/` | 69 | 8,487,899,236 | 50.9–243.6 MB |
+| Synchronized ABP/TCD, `.csv` | `CSV_files/` | 84 | 2,022,403,791 | 2.5–56.6 MB |
+| Clinical data and its data dictionary, `.csv` | top level | 2 | 6,179 | 2.8–3.4 KB |
 
-Files range from 5,009 to 198,053,560 bytes. The landing page names the CSV folder both
-`CSV only` and `CSV_only`. The generator assumes `CSV_only/` and puts the clinical CSV at
-the top level; check both paths with `cae_http_tool probe` before the full run.
+Total: 155 data files, 10,510,309,206 bytes, plus `LICENSE.txt`. Table 1 lists only 39
+of the 69 HDF5 files. HDF5 files cover 21 patients and CSV files 20.
 
-HDF5 layout (landing page): the root group holds derived TCD metrics
-(`/TCD,<channel>,<metric>,Float,Multigon`, each with a `,timestamps` twin). `/Trends`
-holds low-rate vital signs and `/Waveforms` holds 125/500 Hz signals. Dataset names
-contain commas.
+HDF5 layout of the `_TRIMMED` files (`h5ls -r`): every dataset sits under `/Waveforms`
+as a `{1, N}` array with a `,timestamps` twin, named
+`<signal>,<site>,SampleSeries,Integer,<device>` (for example
+`TCD,LMCA-U1,SampleSeries,Integer,Multigon`, `ABP,na,SampleSeries,Integer,IntelliVue`).
+The landing page also describes root-level TCD metrics and `/Trends`; the trimmed files
+have neither. The 69 files hold 1,088 datasets, 544 signals plus their timestamps:
+TCD 342, ABP 69, ECG 68, RESP 65.
 
 ## CAE features used
 
 - **https source (PR #1331):** `HttpFileAssimilator` downloads `http(s)://` to
   `file::<path>` only, not straight into the CTE.
-  - Parallel ranged GETs with per-part retries.
+  - Parallel ranged GETs with per-part retries (curl client).
   - A re-run skips files that already have the right size.
   - Credentials come from `~/.clio/cae_http_auth.ini` (sections by host or URL prefix;
     `user`/`password` for basic auth; `${VAR}` expansion; `chmod 600`).
-  - Files are created 0644 and directories 0755.
+  - **`client = wget` (clio-core `d2f4edf42`)**: PhysioNet answers basic auth only from
+    wget and its own clients; anything else gets 403 with no challenge
+    (`raw/2026-11-06-cae-ingest-runs.md`). With `client = wget`, CAE runs wget with the
+    credentials in a private config file. Wget downloads use one stream (no ranges).
+  - `cae_http_tool probe|get` runs the same engine outside the runtime.
 - **Ordering:** `clio_cae` runs transfers in order, and `depends_on` must name the exact
-  `src` or `dst` of an earlier transfer (`CheckDependencies` in `assimilation_ctx.h`). So
-  one OMNI file can download a file and then ingest it.
-- **Unknown keys (PR #1332):** a per-transfer key such as `name` or `description` logs a
-  warning. Only `src`, `dst`, `format`, `depends_on`, `range_off`, `range_size`,
-  `src_token`, `dst_token`, `dataset_filter`, `run` and `run_out` are known.
+  `src` or `dst` of an earlier transfer (`CheckDependencies` in `assimilation_ctx.h`).
+- **Unknown keys (PR #1332):** a per-transfer key such as `name` logs a warning.
 - **Path expansion:** `src`/`dst` are not `${VAR}`-expanded, so paths are absolute.
-- **`run:` steps (PR #1332):** not needed here, because both formats are ingested as they
-  are.
+- **Tag names:** HDF5 dataset names with commas become CTE tags as they are
+  under `target_map/hdf5/<stem>`; `cte_search` found one tag per dataset in every file.
 
 ## OMNI files (`omni/`)
 
-Generated by `omni/make_omni.py` from the Table 1 manifest. Each file becomes two
-transfers: https → `file::`, then ingest with `depends_on` set to the download.
+Generated by `omni/make_omni.py` from `raw/2026-11-05-physionet-target-map-paths.txt`.
 
-| File | Files | Ingest |
-|------|-------|--------|
-| `target_map_smoke.omni.yaml` | clinical CSV and the smallest `.h5` (50.9 MB) | both |
-| `target_map_hdf5.omni.yaml` | 39 `.h5` | `hdf5::` → `iowarp::target_map/hdf5/<stem>`, one tag per dataset |
-| `target_map_csv.omni.yaml` | 84 + 1 `.csv` | `file::` binary → `iowarp::target_map/csv/<stem>` |
+| File | Files | Transfers |
+|------|-------|-----------|
+| `target_map_smoke.omni.yaml` | clinical CSV and `TAR004_D4` (50.9 MB) | download + ingest |
+| `target_map_hdf5.omni.yaml` | 69 `.h5` | download + ingest |
+| `target_map_csv.omni.yaml` | 84 + 2 `.csv` | download + ingest |
+| `target_map_hdf5_ingest.omni.yaml` | 69 `.h5` | ingest only (`--ingest-only`) |
+| `target_map_csv_ingest.omni.yaml` | 84 + 2 `.csv` | ingest only (`--ingest-only`) |
 
-The local copy goes to `/eagle/radix-io/hyoklee/tmap_data/target-map/1.0.0`, not the
-repo's `data/`, because /home has a 45 GB quota. `/eagle/radix-io/hyoklee` is readable by
-the radix-io group and CAE creates files 0644. So create the root with
-`mkdir -p -m 700` first; this keeps the copy private as the DUA requires.
+Ingest: `.h5` → `hdf5::` → `iowarp::target_map/hdf5/<stem>`, one tag per dataset;
+`.csv` → `file::` binary → `iowarp::target_map/csv/<stem>`, one tag per file.
+
+The local copy is in `/eagle/radix-io/hyoklee/tmap_data/target-map/1.0.0`, not the repo's
+`data/`, because /home has a 45 GB quota. `/eagle/radix-io/hyoklee` is readable by the
+radix-io group, so the `tmap_data` root is mode 700, as the DUA requires.
 
 ## Run
 
-`polaris/cae_ingest.pbs` does all of it in one Polaris debug job (`qsub polaris/cae_ingest.pbs`):
+Download (login node, about 3 h for the whole dataset at PhysioNet's rate):
 
-1. Build clio-core (CPU only, CAE + CTE + HDF5) from a worktree of PR #1331's branch
-   (`~/clio-core.http`) into `/eagle/radix-io/hyoklee/tmap_data/build_http`. Later runs
-   rebuild incrementally. PR #1332 is not needed.
-2. Export `PHYSIONET_USER`/`PHYSIONET_PASSWORD` from the hidden files
-   `~/.clio/.physionet_user` and `~/.clio/.physionet_password` (chmod 600).
-   `~/.clio/cae_http_auth.ini` reads them through `${VAR}`, so the secret is never in
-   `qsub -v` or `qstat -f`.
-3. Probe the top level, `HDF5_Trimmed/`, `CSV_only/` and `CSV%20only/` with
-   `cae_http_tool`.
-4. Start the runtime (64 GB DRAM tier) and run `clio_cae` on the smoke, hdf5 and csv
-   OMNI files in turn. If the smoke file fails, the job stops.
-5. Check each download's size against Table 1. For HDF5 files, also check the file
-   signature and compare the dataset count (`h5ls -r`) with the CTE tag count
-   (`cte_search --tags-only`).
+```bash
+export PHYSIONET_USER=$(cat ~/.clio/.physionet_user) PHYSIONET_PASSWORD=$(cat ~/.clio/.physionet_password)
+B=https://physionet.org/files/target-map/1.0.0 D=/eagle/radix-io/hyoklee/tmap_data/target-map/1.0.0
+grep -E '\.(h5|csv)$' raw/2026-11-05-physionet-target-map-paths.txt |
+  xargs -P 4 -I{} cae_http_tool get "$B/{}" "$D/{}"
+(cd $D && sha256sum -c --ignore-missing SHA256SUMS.txt)
+```
 
-The job sets `https_proxy=http://proxy.alcf.anl.gov:3128` for the compute node. Output
-goes to the mode-700 tree `/eagle/radix-io/hyoklee/tmap_data/` (`cae_ingest.log`,
-`runs/run_<jobid>/`).
+Ingest (one debug-queue job, about 5 min with checks):
+
+```bash
+qsub -v OMNIS="hdf5_ingest csv_ingest",CAE_TIMEOUT=1800 polaris/cae_ingest.pbs
+```
+
+`polaris/cae_ingest.pbs`:
+
+1. Builds clio-core (CPU only, CAE + CTE + HDF5) from a worktree of PR #1331's branch
+   (`~/clio-core.http`) into `/eagle/radix-io/hyoklee/tmap_data/build_http`.
+2. Exports `PHYSIONET_USER`/`PHYSIONET_PASSWORD` from `~/.clio/.physionet_user` and
+   `.physionet_password` (chmod 600), so the secret is never in `qsub -v` or `qstat -f`.
+3. Probes one file per server folder with `cae_http_tool`.
+4. Starts the runtime (64 GB DRAM tier) and runs `clio_cae` on each OMNI file in
+   `OMNIS` (from `OMNI_DIR`, default `omni/`). With `CAE_TIMEOUT` set, a run that
+   exceeds it is killed and the runtime's thread stacks go to `stacks_<name>.txt`.
+5. Checks every local file in the OMNI file: SHA-256 against `SHA256SUMS.txt` (kept in the
+   private data directory), and for HDF5 the signature and dataset count (`h5ls -r`)
+   against the CTE tag count (`cte_search --tags-only`).
+
+The job sets `https_proxy=http://proxy.alcf.anl.gov:3128` for the compute node.
 
 ## Results
 
-**Job 7817854, 2026-11-05: blocked by PhysioNet (HTTP 403)**
-(`raw/2026-11-05-cae-ingest-job-7817854.md`)
+All from `raw/2026-11-06-cae-ingest-runs.md` unless noted.
 
-What worked:
-- The PR #1331 build: 121 s from scratch on one node.
-- Credential lookup: `cae_http_tool` matched the `[https://physionet.org/files/]`
-  section and sent basic auth.
-- Runtime start, and `LoadOmni` loading 4 of 4 smoke transfers.
+| Job | What | Outcome |
+|-----|------|---------|
+| 7817854 | smoke, curl client | 403 for everything (`raw/2026-11-05-cae-ingest-job-7817854.md`) |
+| 7818647 | smoke + hdf5, wget client | smoke OK; 13 HDF5 downloads, then the 1 h walltime |
+| 7819031 | hdf5, 6 h | 18 more downloads, then the runtime hung for about 4.5 h |
+| 7823444 | ingest only, `TAR017_D5` | OK, 1.0 s |
+| 7823501 | ingest only, 31 files | OK, 22.4 s, 408/408 tags |
+| (login node) | 123 downloads, 4 streams | OK, 7.1 GB in 10,703 s |
+| 7824018 | ingest only, all 155 files | OK, 69 s, 1,174 tags, all SHA-256 pass |
 
-What failed:
-- Every probe returned 403: the clinical CSV at the top level, `HDF5_Trimmed/`,
-  `CSV_only/` and `CSV%20only/`.
-- `ParseOmni` failed on the first transfer with result code -403, and nothing was
-  downloaded or ingested.
+**Download rate.** PhysioNet gives about 0.35–0.5 MB/s per stream, and about 0.65 MB/s
+in total with four streams. CAE's wget client downloads one file at a time, so the whole
+dataset would take about 6 h inside `clio_cae`.
 
-Because the top-level file fails too, the folder names are not the cause. The 403 page
-is the same with and without credentials: a "Log in" link and "You dont have access to
-see this page". So PhysioNet does not treat the request as logged in. The two possible
-causes are not yet separated:
+**Ingest rate.** From the local copy on Eagle into the DRAM tier: 155 MB/s for HDF5
+(8.49 GB, 54.8 s) and 144 MB/s for CSV (2.02 GB, 14.0 s), including `clio_cae` start-up.
 
-1. **Account access:** the account is not credentialed yet, or the TARGET-MAP data use
-   agreement is not signed. Then even a correct login is refused.
-2. **Login flow:** PhysioNet's documented client is `wget --user ... --ask-password`,
-   and the server may only accept that login flow. CAE (curl) sends basic auth with
-   the first request. If wget works with the same account, PR #1331's client needs to
-   handle PhysioNet's login.
-
-**How to tell them apart:** download the 5 KB clinical CSV with
-`wget --user <user> --ask-password`. A 403 means cause 1; a download means cause 2.
+**Runtime hang (job 7819031).** A download inside `ParseOmni` blocks a pool-400 worker for
+minutes. The scheduler then logged `[#781] worker STALLED` and `[#785] RESCUE` 38,213
+times and spawned 5 elastic workers. At the 31st HDF5 ingest the runtime started looping on
+`GlobalDeserialize::read_binary: Attempted to read beyond end of data` (19.1 M lines,
+4.5 GB of log) and never finished. The same 31 ingests run cleanly in 22 s without
+downloads, so the trigger is the long-running task, not the data. Not yet reported to
+iowarp/clio-core.
 
 ## Open
 
-- Separate the two causes of the 403 with the wget test above; then rerun
-  `polaris/cae_ingest.pbs`.
-- Confirm the server folder names (`HDF5_Trimmed/`, `CSV_only/`); this needs working
-  access.
-- Check that HDF5 dataset names with commas map to valid CTE tag names.
+- Report the runtime hang to iowarp/clio-core.
 - Test whether the CLIO HDF5 VOL connector can read the ingested tags; see [[neurofair]] for
   which CLIO read paths actually serve data from the CTE.
-- Record the download and ingest timings.
+- The CTE holds the data only while the runtime runs (DRAM tier); a read benchmark has to
+  ingest in the same job, or use a persistent tier.

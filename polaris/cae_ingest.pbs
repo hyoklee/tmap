@@ -29,7 +29,9 @@ ROOT=/eagle/radix-io/hyoklee/tmap_data
 DATA=$ROOT/target-map/1.0.0
 BUILD=${BUILD:-$ROOT/build_http}
 BIN=$BUILD/bin
-OMNIS=${OMNIS:-"smoke hdf5 csv"}   # omni/target_map_<name>.omni.yaml, in order; stops if smoke fails
+OMNIS=${OMNIS:-"smoke hdf5 csv"}   # $OMNI_DIR/target_map_<name>.omni.yaml, in order; stops if smoke fails
+OMNI_DIR=${OMNI_DIR:-$TMAP/omni}
+CAE_TIMEOUT=${CAE_TIMEOUT:-0}      # seconds per clio_cae run; 0 = none. On timeout, dump runtime stacks
 SUMS=$DATA/SHA256SUMS.txt   # private: checksums of restricted files stay off the repo
 CONDA=/home/hyoklee/miniconda3
 CMAKE=$CONDA/bin/cmake
@@ -131,15 +133,21 @@ sleep 5
 ts "runtime up"
 
 run_omni() {   # run_omni <name>: clio_cae on one OMNI file, then check what it landed
-local OMNI=$TMAP/omni/target_map_$1.omni.yaml
-ts "=== $1: $(grep -c '^  - src: "https' "$OMNI") files"
+local OMNI=$OMNI_DIR/target_map_$1.omni.yaml
+ts "=== $1: $(grep -c '^  - src: ' "$OMNI") transfers, $(grep -c '^  - src: "https' "$OMNI") downloads"
 local t0 rc fail=0 bytes=0 dt
 t0=$(date +%s.%N)
-"$BIN/clio_cae" "$OMNI" > "$RUN/clio_cae_$1.log" 2>&1
+timeout "$CAE_TIMEOUT" "$BIN/clio_cae" "$OMNI" > "$RUN/clio_cae_$1.log" 2>&1
 rc=$?
+if [ $rc = 124 ]; then
+  ts "clio_cae $1 timed out after $CAE_TIMEOUT s; runtime stacks -> stacks_$1.txt"
+  gdb -batch -p "$(pgrep -n -f "$BIN/clio_run" -u "$USER")" -ex "thread apply all bt" > "$RUN/stacks_$1.txt" 2>&1
+  grep -c "^Thread" "$RUN/stacks_$1.txt"
+fi
 dt=$(echo "$(date +%s.%N) - $t0" | bc)
 ts "clio_cae $1 rc=$rc in $dt s"
-grep -E 'HttpFileAssimilator|ParseOmni|ERROR|FAILED|assimilat' "$RUN/clio_cae_$1.log" "$RUN/runtime.log" | cut -c1-300 | tail -30
+grep -E 'HttpFileAssimilator|ParseOmni|ERROR|FAILED|assimilat' "$RUN/clio_cae_$1.log" | grep -v HANGWATCH | cut -c1-300 | tail -15
+tail -c 20000000 "$RUN/runtime.log" | grep -E 'ERROR|FAILED' | sed -E 's/[0-9]+/N/g' | sort | uniq -c | sort -rn | cut -c1-260 | head -8
 
 local dst rel name got want ok extra sig nds stem ntag nblob
 while read -r dst; do
@@ -163,7 +171,7 @@ while read -r dst; do
     extra="cte_tags=$ntag blobs=$nblob"
   fi
   echo "CHECK $rel size=$got sha256=$ok $extra"
-done < <(grep -o '^    dst: "file::[^"]*"' "$OMNI" | sed 's/^    dst: "file:://; s/"$//')
+done < <(grep -oE '^ *(- )?(dst: "file|src: "(file|hdf5))::[^"]*"' "$OMNI" | sed -E 's/^.*:: *//; s/^[^:]*:://; s/"$//' | awk '!seen[$0]++')
 ts "$1: clio_cae rc=$rc, $bytes bytes in $dt s = $(echo "scale=1; $bytes / 1000000 / $dt" | bc) MB/s (download + ingest), sha256 check $([ $fail = 0 ] && echo pass || echo FAIL)"
 [ $rc = 0 ] && [ $fail = 0 ]
 }

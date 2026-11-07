@@ -28,15 +28,19 @@ Some recordings also include EEG.
 | `.csv` | Synchronized ABP and TCD; time starts at 0 per recording |
 | clinical `.csv` | De-identified baseline clinical data (~5 KB) |
 
-Files range from about 2.5 MB to about 198 MB. The HDF5 files are the natural input for
-CLIO I/O tests. Table 1 lists 124 files (39 `.h5`, 85 `.csv`, 6.36 GB in all); see
-[[clio-cae-ingest]] for the inventory and the OMNI files that ingest them.
+The HDF5 files are the natural input for CLIO I/O tests. The landing page's Table 1 lists
+124 files (39 `.h5`, 85 `.csv`, 6.36 GB). The server holds more: 69 `.h5` in
+`HDF5_Trimmed/`, 84 `.csv` in `CSV_files/` and 2 top-level `.csv`, 10.5 GB in all, with
+files from 2.5 MB to 244 MB (`raw/2026-11-06-cae-ingest-runs.md`). See
+[[clio-cae-ingest]] for the inventory, the HDF5 layout and the OMNI files.
 
 ## Access
 
 Restricted: credentialed PhysioNet account plus the signed Restricted Health Data Use
-Agreement 1.5.0. Keep the data in the git-ignored `data/` directory; see the restricted-data
-rules in `CLAUDE.md`. Download:
+Agreement 1.5.0. Keep the data out of the repo (the git-ignored `data/` directory, or the
+mode-700 copy on Eagle that [[clio-cae-ingest]] uses); see the restricted-data rules in
+`CLAUDE.md`. PhysioNet accepts basic auth only from wget and its own clients
+([[clio-cae-ingest]]). Download:
 
 ```bash
 wget -r -N -c -np --user <physionet-username> --ask-password \
@@ -55,5 +59,4 @@ Also cite Pollard, T., et al. (2026). PhysioNet as a global platform for biomedi
 
 ## Open
 
-- Run the [[clio-cae-ingest]] OMNI files and record the actual inventory and HDF5 layout.
 - Decide which CLIO workloads to test after ingest.
