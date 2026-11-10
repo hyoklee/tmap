@@ -30,9 +30,9 @@ The two share no data.
 
 | NeuroFAIR finding | What it means for tmap |
 |---|---|
-| Only the HDF5 **VOL** connector serves reads from the CTE. It reads CTE-core blobs and bypasses clio-fs. The **VFD** only writes to the tier (no `PreadFd`), so its reads track native. The POSIX adapter needs `clio::` paths; the VFD refuses them (`NF:concept-clio-fs-vs-hdf5-vfd.md`). | CAE's HDF5 assimilator also writes CTE-core tags, one per dataset ([[clio-cae-ingest]]). The question to test: can the VOL read what CAE ingested? If not, a read benchmark has to go through clio-fs or plain files. |
+| Only the HDF5 **VOL** connector serves reads from the CTE. It reads CTE-core blobs and bypasses clio-fs. The **VFD** only writes to the tier (no `PreadFd`), so its reads track native. The POSIX adapter needs `clio::` paths; the VFD refuses them (`NF:concept-clio-fs-vs-hdf5-vfd.md`). | Tested ([[clio-cae-ingest]], job 7826129): the VOL does not read CAE's `format: hdf5` tags (one per dataset), but it serves 100 % of reads from the CTE, byte-identical, when CAE stages with `format: hdf5_vol`. |
 | The 2026-05 result that tier reads were ~4× slower than NFS with `GetBlob` errors (`NF:miv_iowarp_ares_case7_feasibility.md`) came before clio-core #470 was fixed (closed 2026-07-15). | Don't plan around it. Current-dev overheads on MiV case 7 are VFD +0.5 %, VOL +4.3 %, VFD read tier +4.2 % and clio-fs via the MPI-IO adapter +4.5 % (`NF:miv_iowarp_ares_case7_1020.md`). |
-| On jelly's slow disk the CTE RAM tier is ~7–10× faster for writes and uncached reads (1.9–2.4 GB/s). A warm page cache (2.9 GB/s) wins for small data read once (`NF:miv_jelly_iowarp.md`). | TARGET-MAP is 6.36 GB with files ≤198 MB ([[clio-cae-ingest]]), so it fits in a Polaris node's page cache. A CTE gain needs cold reads or repeated reads across jobs or nodes, not one warm pass. |
+| On jelly's slow disk the CTE RAM tier is ~7–10× faster for writes and uncached reads (1.9–2.4 GB/s). A warm page cache (2.9 GB/s) wins for small data read once (`NF:miv_jelly_iowarp.md`). | TARGET-MAP is 10.5 GB with files ≤244 MB ([[clio-cae-ingest]]), so it fits in a Polaris node's page cache. A CTE gain needs cold reads or repeated reads across jobs or nodes, not one warm pass. Confirmed on Polaris: the VOL read 395 MB from the DRAM tier at 0.99 GB/s, against 0.25 GB/s for a first Eagle read and 3.0 GB/s warm ([[clio-cae-ingest]]). |
 | MiV is compute-bound, so CTE never sped it up (`NF:miv_iowarp_ares_case7_feasibility.md`). | An autoregulation analysis over the TCD/ABP series ([[target-map]]) is closer to I/O-bound: many recordings, light arithmetic. It may be the regime NeuroFAIR could not reach. |
 | Running clio-fs under parallel HDF5 needed OMPIO and a raised `fbtl_posix_max_gap_size`. ROMIO rejects the `clio::` prefix (`NF:miv_iowarp_ares_case7_clio_fs.md`). | Only relevant if tmap reads through MPI-IO. Serial h5py reads avoid it. |
 
@@ -82,7 +82,7 @@ What tmap can still take from NeuroFAIR:
 
 ## Open
 
-- Once PhysioNet access works, test whether the CLIO VOL connector reads the tags CAE
-  ingested.
+- ~~Test whether the CLIO VOL connector reads the tags CAE ingested.~~ Done: only with
+  `format: hdf5_vol` ([[clio-cae-ingest]]).
 - Pick an I/O-bound TARGET-MAP read workload (cold or repeated reads) to compare native,
   VOL and clio-fs.

@@ -1,0 +1,170 @@
+#!/bin/bash
+#PBS -N tmap-vol
+#PBS -l select=1:system=polaris
+#PBS -l walltime=01:00:00
+#PBS -l filesystems=home:eagle
+#PBS -q debug
+#PBS -A radix-io
+#PBS -j oe
+#PBS -o /eagle/radix-io/hyoklee/tmap_data/vol_read.log
+#
+# Can the CLIO HDF5 VOL connector read what CAE ingested? Three TARGET-MAP files,
+# already downloaded and verified (see cae_ingest.pbs):
+#   0. native reads with vol_read (HDF5_VOL_CONNECTOR unset): baseline hashes, times
+#   A. CAE format "hdf5" (what target_map_*.omni.yaml use: one tag per dataset), then
+#      two reads through the VOL (HDF5_VOL_CONNECTOR=clio, CLIO_VOL_TRACE on)
+#   B. fresh runtime; CAE format "hdf5_vol" (stages into the VOL's own layout:
+#      tag "hdf5:<realpath>", blobs "<dataset>/chunk_<i>", coherence stamp), then
+#      two reads through the VOL
+# Each VOL read's hashes are compared with the native ones, and the VOL trace
+# summary (coherence, bytes from cache vs native) is printed.
+# Output: /eagle/radix-io/hyoklee/tmap_data/runs/run_<jobid>/ (private).
+set -uo pipefail
+SRC=${SRC:-/home/hyoklee/clio-core.http}
+TMAP=/home/hyoklee/tmap
+ROOT=/eagle/radix-io/hyoklee/tmap_data
+DATA=$ROOT/target-map/1.0.0
+BUILD=${BUILD:-$ROOT/build_http}
+BIN=$BUILD/bin
+CONDA=/home/hyoklee/miniconda3
+FILES=${FILES:-"TAR004_D4 TAR017_D5 TAR031_D2"}   # HDF5_Trimmed/<name>_ALL_TRIMMED.h5
+JOBID=${PBS_JOBID%%.*}
+umask 077
+RUN=$ROOT/runs/run_${JOBID:-manual}
+mkdir -p "$RUN"
+exec > >(tee -a "$RUN/job.log") 2>&1
+T0=$SECONDS
+ts() { echo "[$(date +%T) +$((SECONDS - T0))s] $*"; }
+ts "host=$(hostname) run=$RUN clio-core=$(git -C "$SRC" log --oneline -1)"
+
+# --- build -----------------------------------------------------------------------
+grep -q '^CLIO_CTE_ENABLE_HDF5_VOL:BOOL=ON' "$BUILD/CMakeCache.txt" || { ts "ERROR: configure with -DCLIO_CTE_ENABLE_HDF5_VOL=ON"; exit 1; }
+$CONDA/bin/cmake --build "$BUILD" -j "$(nproc)" > "$RUN/build.log" 2>&1 \
+  || { ts "ERROR: build failed"; grep -m5 -B2 -A5 'error' "$RUN/build.log"; exit 1; }
+[ -f "$BIN/libclio_hdf5_vol.so" ] || { ts "ERROR: libclio_hdf5_vol.so not built"; exit 1; }
+ldd "$BIN/libclio_hdf5_vol.so" | grep -o 'libhdf5[^ ]* => [^ ]*'
+/usr/bin/gcc-14 -O2 -o "$RUN/vol_read" "$TMAP/polaris/vol_read.c" -I$CONDA/include -L$CONDA/lib \
+  -Wl,-rpath,$CONDA/lib -lhdf5 || { ts "ERROR: vol_read build failed"; exit 1; }
+ts "build OK"
+
+PATHS=()
+for f in $FILES; do PATHS+=("$DATA/HDF5_Trimmed/${f}_ALL_TRIMMED.h5"); done
+ls -l "${PATHS[@]}" | awk '{print $5, $NF}'
+
+# --- 0. native baseline (second pass is page-cache warm) ---------------------------
+"$RUN/vol_read" "${PATHS[@]}" > "$RUN/native1.txt"; echo "native1 rc=$?"
+"$RUN/vol_read" "${PATHS[@]}" > "$RUN/native2.txt"; echo "native2 rc=$?"
+grep ^TOTAL "$RUN/native1.txt" "$RUN/native2.txt" | sed "s#$RUN/##"
+
+# --- runtime ---------------------------------------------------------------------------
+export CLIO_SERVER_CONF=$RUN/clio_server.yaml CLIO_MEMFD_DIR=/tmp/clio_memfd_${JOBID:-manual}
+export CLIO_IPC_MODE=SHM CTP_LOG_LEVEL=${CTP_LOG_LEVEL:-info}
+mkdir -p "$CLIO_MEMFD_DIR"
+cat > "$CLIO_SERVER_CONF" <<EOF
+memory:
+  main_segment_size: auto
+  client_data_segment_size: 4GB
+networking:
+  port: ${CLIO_PORT:-9415}
+runtime:
+  num_threads: 16
+  queue_depth: 1024
+compose:
+  - mod_name: clio_cae_core
+    pool_name: cae_main
+    pool_query: local
+    pool_id: "400.0"
+    next_pool_id: "512.0"
+  - mod_name: clio_cte_core
+    pool_name: cte_main
+    pool_query: local
+    pool_id: "512.0"
+    storage:
+      - path: "ram::tmap_ram"
+        bdev_type: "ram"
+        capacity_limit: "64GB"
+        score: 1.0
+    dpe:
+      dpe_type: "max_bw"
+    performance:
+      flush_data_period_ms: 0
+EOF
+RT=""
+stop_rt() {
+  [ -n "$RT" ] || return 0
+  timeout 120 "$BIN/clio_run" stop >> "$RUN/runtime_$1.log" 2>&1; sleep 2; kill -9 "$RT" 2>/dev/null
+  wait "$RT" 2>/dev/null; RT=""
+}
+start_rt() {   # start_rt <label>: fresh runtime, log to runtime_<label>.log
+  rm -rf "$RUN/clio_disk"
+  "$BIN/clio_run" start --fresh --disk "$RUN/clio_disk" --no-viz > "$RUN/runtime_$1.log" 2>&1 &
+  RT=$!
+  for _ in $(seq 90); do
+    "$BIN/clio_run" status > /dev/null 2>&1 && break
+    kill -0 $RT 2>/dev/null || { ts "ERROR: runtime exited"; tail -20 "$RUN/runtime_$1.log"; exit 1; }
+    sleep 2
+  done
+  sleep 5
+  ts "runtime $1 up"
+}
+LABEL=""
+trap 'set +e; stop_rt "$LABEL"; rm -rf "${CLIO_MEMFD_DIR:?}"' EXIT
+
+omni() {   # omni <label> <format>: write and run a CAE OMNI file for FILES
+  local o=$RUN/$1.omni.yaml f p
+  { echo 'version: "1.0"'; echo; echo 'transfers:'
+    for p in "${PATHS[@]}"; do
+      f=$(basename "$p" .h5)
+      echo "  - src: \"hdf5::$p\""
+      if [ "$2" = hdf5_vol ]; then echo '    dst: "iowarp::"'; else echo "    dst: \"iowarp::tmapvol/hdf5/$f\""; fi
+      echo "    format: \"$2\""
+    done; } > "$o"
+  local t0=$(date +%s.%N)
+  timeout 900 "$BIN/clio_cae" "$o" > "$RUN/clio_cae_$1.log" 2>&1
+  ts "clio_cae $1 ($2) rc=$? in $(echo "$(date +%s.%N) - $t0" | bc) s"
+  grep -E 'ERROR|staged|Stage' "$RUN/clio_cae_$1.log" "$RUN/runtime_$LABEL.log" | sed "s#$RUN/##" | cut -c1-260 | tail -8
+  echo "  tags: $("$BIN/cte_search" '.*' --tags-only 2>/dev/null | grep -c .) (hdf5: $("$BIN/cte_search" 'hdf5:.*' --tags-only 2>/dev/null | grep -c .))"
+}
+
+vol() {   # vol <label>: read FILES through the VOL with tracing, compare with native
+  local tr=$RUN/trace_$1
+  mkdir -p "$tr"
+  HDF5_PLUGIN_PATH=$BIN HDF5_VOL_CONNECTOR=clio CLIO_VOL_TRACE=$tr \
+    timeout 900 "$RUN/vol_read" "${PATHS[@]}" > "$RUN/$1.txt" 2> "$RUN/$1.err"
+  ts "vol $1 rc=$?"
+  grep ^TOTAL "$RUN/$1.txt"
+  if diff <(awk '$1=="DS"{print $2, $3, $NF}' "$RUN/native1.txt") \
+          <(awk '$1=="DS"{print $2, $3, $NF}' "$RUN/$1.txt") > /dev/null; then
+    echo "  data: identical to native ($(grep -c ^DS "$RUN/$1.txt") datasets)"
+  else
+    echo "  data: DIFFERS from native"
+  fi
+  /usr/bin/python3 - "$tr" <<'PY'
+import glob, json, sys
+for f in sorted(glob.glob(sys.argv[1] + "/*.access.json")):
+    j = json.load(open(f))
+    t = j.get("totals", {})
+    keep = {k: t[k] for k in t if k in ("reads", "read_served", "cache_hit_rate",
+            "read_bytes_from_cache", "read_bytes_from_native", "staged_bytes", "bytes_staged")}
+    print("  trace", j.get("file", f).rsplit("/", 1)[-1], "coherence", json.dumps(j.get("coherence")),
+          json.dumps(keep))
+PY
+  head -3 "$RUN/$1.err"
+}
+
+# --- A: format hdf5 (as ingested for tmap) --------------------------------------------
+LABEL=A; start_rt A
+omni A_hdf5 hdf5
+vol A_vol1
+vol A_vol2
+stop_rt A
+
+# --- B: format hdf5_vol (the VOL's own layout) ----------------------------------------
+LABEL=B; start_rt B
+omni B_hdf5_vol hdf5_vol
+vol B_vol1
+vol B_vol2
+stop_rt B
+LABEL=""
+echo "=== runtime errors: A $(grep -c ' ERROR ' "$RUN/runtime_A.log"), B $(grep -c ' ERROR ' "$RUN/runtime_B.log")"
+ts "done"

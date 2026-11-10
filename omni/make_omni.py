@@ -21,7 +21,13 @@ for files already downloaded (for example with cae_http_tool get). Use these for
 full dataset: one clio_cae run that downloads for hours hung the runtime (wiki:
 clio-cae-ingest), while ingest alone takes seconds.
 
-usage: make_omni.py [--data DIR] [--tag-root NAME] [--ingest-only]
+With --vol, write target_map_hdf5_vol.omni.yaml: ingest only, HDF5 files only, with
+format hdf5_vol and dst "iowarp::". CAE then stages each file in the CLIO HDF5 VOL
+connector's own layout (tag "hdf5:<path>", coherence stamp), so a program that opens the
+file with HDF5_VOL_CONNECTOR=clio reads it from the CTE. The VOL does not read the
+per-dataset tags of format hdf5 (raw/2026-11-07-vol-read-job-7826129.md).
+
+usage: make_omni.py [--data DIR] [--tag-root NAME] [--ingest-only | --vol]
 """
 import argparse
 from pathlib import Path
@@ -45,7 +51,7 @@ HEADER = """\
 #
 # Each file: an https download to file::, then ingest into the CTE once that download
 # is done (depends_on = the download's dst). A re-run skips files already downloaded.
-# (*_ingest.omni.yaml files hold the ingest transfers only.)
+# (*_ingest.omni.yaml and *_vol.omni.yaml files hold the ingest transfers only.)
 version: "1.0"
 
 transfers:
@@ -56,6 +62,10 @@ def ingest(rel, args):
     """The transfer that ingests one downloaded file into the CTE."""
     local = f"{args.data}/{rel}"
     stem = rel.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+    if rel.endswith(".h5") and args.vol:
+        return (f'  - src: "hdf5::{local}"\n'
+                f'    dst: "iowarp::"\n'
+                f'    format: "hdf5_vol"\n')
     if rel.endswith(".h5"):
         return (f'  - src: "hdf5::{local}"\n'
                 f'    dst: "iowarp::{args.tag_root}/hdf5/{stem}"\n'
@@ -67,7 +77,7 @@ def ingest(rel, args):
 
 def entries(paths, args):
     for rel in paths:
-        if args.ingest_only:
+        if args.ingest_only or args.vol:
             yield f"  # {rel}\n" + ingest(rel, args)
             continue
         local = f"{args.data}/{rel}"
@@ -91,8 +101,11 @@ def main():
     ap.add_argument("--data", default="/eagle/radix-io/hyoklee/tmap_data/target-map/1.0.0",
                     help="local copy of the dataset (src/dst paths are not ${VAR}-expanded, so absolute)")
     ap.add_argument("--tag-root", default="target_map", help="CTE tag prefix")
-    ap.add_argument("--ingest-only", action="store_true",
-                    help="write *_ingest.omni.yaml files for data already downloaded")
+    mode = ap.add_mutually_exclusive_group()
+    mode.add_argument("--ingest-only", action="store_true",
+                      help="write *_ingest.omni.yaml files for data already downloaded")
+    mode.add_argument("--vol", action="store_true",
+                      help="write target_map_hdf5_vol.omni.yaml (format hdf5_vol, for the HDF5 VOL)")
     args = ap.parse_args()
 
     paths = [l.strip() for l in open(PATHS) if l.strip() and not l.startswith("#")]
@@ -101,6 +114,11 @@ def main():
     csvs = [p for p in data if p.endswith(".csv")]
     assert all(s in data for s in SMOKE), "smoke files missing from the path list"
 
+    if args.vol:
+        write("target_map_hdf5_vol.omni.yaml",
+              "HDF5_Trimmed, staged for the CLIO HDF5 VOL connector (format hdf5_vol). Ingest only:"
+              " the files must already be downloaded and verified", h5, args)
+        return
     if args.ingest_only:
         note = "Ingest only: the files must already be downloaded and verified"
         write("target_map_hdf5_ingest.omni.yaml", f"HDF5_Trimmed. {note}", h5, args)
