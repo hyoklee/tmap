@@ -28,6 +28,8 @@ BUILD=${BUILD:-$ROOT/build_http}
 BIN=$BUILD/bin
 CONDA=/home/hyoklee/miniconda3
 FILES=${FILES:-"TAR004_D4 TAR017_D5 TAR031_D2"}   # HDF5_Trimmed/<name>_ALL_TRIMMED.h5
+CASES=${CASES:-"A B"}   # which cases to run; VOL settings such as CLIO_VOL_ADMIT_COST=0
+                        # can be passed with qsub -v and reach every VOL read
 JOBID=${PBS_JOBID%%.*}
 umask 077
 RUN=$ROOT/runs/run_${JOBID:-manual}
@@ -36,6 +38,7 @@ exec > >(tee -a "$RUN/job.log") 2>&1
 T0=$SECONDS
 ts() { echo "[$(date +%T) +$((SECONDS - T0))s] $*"; }
 ts "host=$(hostname) run=$RUN clio-core=$(git -C "$SRC" log --oneline -1)"
+ts "cases: $CASES; VOL env: $(env | grep -E '^CLIO_VOL_' | tr '\n' ' ')"
 
 # --- build -----------------------------------------------------------------------
 grep -q '^CLIO_CTE_ENABLE_HDF5_VOL:BOOL=ON' "$BUILD/CMakeCache.txt" || { ts "ERROR: configure with -DCLIO_CTE_ENABLE_HDF5_VOL=ON"; exit 1; }
@@ -153,18 +156,23 @@ PY
 }
 
 # --- A: format hdf5 (as ingested for tmap) --------------------------------------------
-LABEL=A; start_rt A
-omni A_hdf5 hdf5
-vol A_vol1
-vol A_vol2
-stop_rt A
+if [[ " $CASES " == *" A "* ]]; then
+  LABEL=A; start_rt A
+  omni A_hdf5 hdf5
+  vol A_vol1
+  vol A_vol2
+  vol A_vol3
+  stop_rt A
+fi
 
 # --- B: format hdf5_vol (the VOL's own layout) ----------------------------------------
-LABEL=B; start_rt B
-omni B_hdf5_vol hdf5_vol
-vol B_vol1
-vol B_vol2
-stop_rt B
+if [[ " $CASES " == *" B "* ]]; then
+  LABEL=B; start_rt B
+  omni B_hdf5_vol hdf5_vol
+  vol B_vol1
+  vol B_vol2
+  stop_rt B
+fi
 LABEL=""
-echo "=== runtime errors: A $(grep -c ' ERROR ' "$RUN/runtime_A.log"), B $(grep -c ' ERROR ' "$RUN/runtime_B.log")"
+for c in $CASES; do echo "=== runtime errors $c: $(grep -c ' ERROR ' "$RUN/runtime_$c.log")"; done
 ts "done"

@@ -4,14 +4,15 @@ Sources: `raw/2026-11-05-physionet-target-map-files.tsv` (Table 1 of the PhysioN
 landing page), `raw/2026-11-05-physionet-target-map-paths.txt` (the server's
 SHA256SUMS.txt paths), `raw/2026-11-05-cae-ingest-job-7817854.md` (first run),
 `raw/2026-11-06-cae-ingest-runs.md` (later runs), `raw/2026-11-07-vol-read-job-7826129.md`
-(VOL read test), [[target-map]], and iowarp/clio-core PRs #1331 and #1332.
+and `raw/2026-11-12-vol-read-job-7838851.md` (VOL read tests), [[target-map]], and iowarp/clio-core PRs #1331 and #1332.
 
 **Status (2026-11-06):** all 155 data files (10.5 GB) are downloaded, pass SHA-256, and
 are ingested into the CTE in 69 s: 1,174 `target_map` tags. The working recipe is
 download with `cae_http_tool get`, then ingest with the `*_ingest.omni.yaml` files. One
 `clio_cae` run that downloads and ingests everything hangs the runtime (see Results).
 The CLIO HDF5 VOL connector does **not** read the `format: hdf5` tags; it does read files
-staged with `format: hdf5_vol` (see [Reading through the HDF5 VOL](#reading-through-the-hdf5-vol)).
+staged with `format: hdf5_vol`, or caches them itself on first read with
+`CLIO_VOL_ADMIT_COST=0` (see [Reading through the HDF5 VOL](#reading-through-the-hdf5-vol)).
 
 ## File inventory
 
@@ -165,8 +166,23 @@ With the `hdf5` tags the VOL fell back to native reads and did not cache them ei
 most reads were logged "uncacheable" and nothing was staged. That fits the VOL's cost
 gate (on by default): after 4 native reads of 64 KiB or more on a device that beat the
 tier's assumed 1.2 GB/s, the VOL stops caching that device's files. Here Eagle was being
-read from this node's page cache. `CLIO_VOL_ADMIT_COST=0` turns the gate off;
-`CLIO_VOL_TIER_MBPS` changes the assumed tier speed. Neither was tried.
+read from this node's page cache. `CLIO_VOL_TIER_MBPS` changes the assumed tier speed.
+
+**Without the gate** (job 7838851, `CLIO_VOL_ADMIT_COST=0`, `format: hdf5` ingest,
+`raw/2026-11-12-vol-read-job-7838851.md`), the VOL caches on its own:
+
+| VOL pass | Coherence | Reads from CTE | Bytes staged | Whole reads |
+|---|---|---|---|---|
+| 1 | no stamp | 42 of 84 (the slab reads after each whole read) | all 395 MB | 1.01 s |
+| 2 | matched | 84 of 84 | 0 | 0.40 s |
+| 3 | matched | 84 of 84 | 0 | 0.39 s |
+
+Data was identical to native on every pass. Pass 1 costs about 0.9 s more than a warm
+native read (0.115 s); after it, reads run at the same speed as `hdf5_vol` staging. The
+VOL still ignored the 42 per-dataset tags and staged its own copy, so the CTE held the
+data twice. For VOL readers, `format: hdf5_vol` is the better choice: one copy, 0.56 s to
+stage the three files, no gate setting, and the first read is already served from the
+CTE.
 
 Whole-dataset reads, three files together (395 MB):
 
@@ -185,8 +201,6 @@ overhead on the native path is small: the fallback reads ran at warm-native spee
 ## Open
 
 - Follow up on the runtime-hang report on PR #1331.
-- VOL with `format: hdf5`: rerun with `CLIO_VOL_ADMIT_COST=0` to see whether read-miss
-  admission stages the data on the first pass and serves the second from the CTE.
 - A fair CTE comparison needs cold reads (drop the page cache, or another node) or reads in
   a later job; the warm case above already favours Eagle.
 - The CTE holds the data only while the runtime runs (DRAM tier); a read benchmark has to
